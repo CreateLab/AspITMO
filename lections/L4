@@ -1,0 +1,938 @@
+# Аутентификация и авторизация в ASP.NET Core: глубокое техническое погружение
+
+## ВСТУПЛЕНИЕ
+
+Эта техническая лекция представляет собой **максимально детальное** погружение во внутреннюю работу системы аутентификации и авторизации ASP.NET Core. Цель - дать полное понимание каждого класса, метода и параметра, чтобы вы могли уверенно работать с этими механизмами на production уровне.
+
+**Целевая аудитория:** Опытные .NET разработчики, которые хотят глубоко понять внутреннее устройство системы безопасности ASP.NET Core.
+
+**Версии .NET:** Материал актуален для .NET 6, 7 и 8.
+
+---
+
+## 1. JWT ТОКЕНЫ - ТЕХНИЧЕСКИЕ ДЕТАЛИ
+
+### 1.1. System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler
+
+**Namespace:** `System.IdentityModel.Tokens.Jwt`  
+**Assembly:** NuGet пакет `System.IdentityModel.Tokens.Jwt`  
+**Назначение:** Центральный класс для создания, чтения и валидации JWT токенов
+
+JWT состоит из трёх частей: `{header}.{payload}.{signature}`, каждая закодирована в Base64Url формате.
+
+#### WriteToken(SecurityToken token)
+
+**Сигнатура:**
+```csharp
+public virtual string WriteToken(SecurityToken token)
+```
+
+**Что делает:** Сериализует SecurityToken объект в строку JWT формата. Процесс:
+1. Кодирует header в Base64Url
+2. Кодирует payload в Base64Url  
+3. Генерирует подпись используя алгоритм и ключ из SigningCredentials
+4. Объединяет: `base64url(header).base64url(payload).base64url(signature)`
+
+**Пример:**
+```csharp
+var handler = new JwtSecurityTokenHandler();
+var key = Encoding.UTF8.GetBytes("your-256-bit-secret-key-here-min-32-chars");
+
+var tokenDescriptor = new SecurityTokenDescriptor
+{
+    Subject = new ClaimsIdentity(new[] 
+    { 
+        new Claim("sub", "12345"),
+        new Claim("name", "John Doe")
+    }),
+    Expires = DateTime.UtcNow.AddHours(1),
+    SigningCredentials = new SigningCredentials(
+        new SymmetricSecurityKey(key),
+        SecurityAlgorithms.HmacSha256Signature)
+};
+
+var token = handler.CreateToken(tokenDescriptor);
+string jwt = handler.WriteToken(token);
+// Результат: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOi..."
+```
+
+#### ReadJwtToken(string token)
+
+**Сигнатура:**
+```csharp
+public virtual JwtSecurityToken ReadJwtToken(string token)
+```
+
+**ВАЖНО:** Этот метод **НЕ валидирует** токен! Он только парсит структуру.
+
+**Процесс:**
+- Разбивает строку по точкам
+- Декодирует header и payload из Base64Url
+- Создаёт объект JwtSecurityToken
+- НЕ проверяет подпись, срок действия, issuer и т.д.
+
+**Исключения:**
+- `ArgumentNullException` - token пуст
+- `ArgumentException` - token.Length > MaximumTokenSizeInBytes (250KB по умолчанию)
+- `SecurityTokenMalformedException` - неверный формат
+
+**Использование:**
+```csharp
+var handler = new JwtSecurityTokenHandler();
+var jwt = handler.ReadJwtToken(tokenString);
+
+Console.WriteLine($"Algorithm: {jwt.Header.Alg}");
+Console.WriteLine($"Issuer: {jwt.Issuer}");
+Console.WriteLine($"Expires: {jwt.ValidTo}");
+
+foreach (var claim in jwt.Claims)
+{
+    Console.WriteLine($"{claim.Type}: {claim.Value}");
+}
+```
+
+#### ValidateToken()
+
+**Сигнатура:**
+```csharp
+public virtual ClaimsPrincipal ValidateToken(
+    string token,
+    TokenValidationParameters validationParameters,
+    out SecurityToken validatedToken)
+```
+
+**Полный процесс валидации (пошагово):**
+
+1. **Парсинг:** Проверяет формат токена (3 части для JWS, 5 для JWE)
+2. **Валидация Lifetime:** Проверяет nbf (not before) и exp (expiration) с учётом ClockSkew
+3. **Валидация Issuer:** Сравнивает claim "iss" с ValidIssuer/ValidIssuers
+4. **Валидация Audience:** Проверяет, что claim "aud" содержит ValidAudience
+5. **Валидация подписи:** Криптографически проверяет подпись используя IssuerSigningKey
+6. **Создание ClaimsPrincipal:** Конвертирует claims в ClaimsPrincipal объект
+
+**Пример с обработкой ошибок:**
+```csharp
+var handler = new JwtSecurityTokenHandler();
+var key = Encoding.UTF8.GetBytes(secretKey);
+
+var validationParams = new TokenValidationParameters
+{
+    ValidateIssuerSigningKey = true,
+    IssuerSigningKey = new SymmetricSecurityKey(key),
+    
+    ValidateIssuer = true,
+    ValidIssuer = "https://myapi.com",
+    
+    ValidateAudience = true,
+    ValidAudience = "https://myapi.com",
+    
+    ValidateLifetime = true,
+    ClockSkew = TimeSpan.Zero // Убираем 5-минутный буфер!
+};
+
+try
+{
+    var principal = handler.ValidateToken(token, validationParams, out var validatedToken);
+    var userId = principal.FindFirst("sub")?.Value;
+    return userId;
+}
+catch (SecurityTokenExpiredException)
+{
+    // Токен истёк
+}
+catch (SecurityTokenInvalidSignatureException)
+{
+    // Неверная подпись - возможна подделка!
+}
+catch (SecurityTokenInvalidIssuerException)
+{
+    // Неверный издатель
+}
+```
+
+### 1.2. TokenValidationParameters - ПОЛНЫЙ РАЗБОР
+
+#### ValidateLifetime и ClockSkew
+
+**ClockSkew:** **ПО УМОЛЧАНИЮ 5 МИНУТ!** Это означает, что токены остаются валидными 5 минут после истечения срока.
+
+```csharp
+// По умолчанию
+ClockSkew = TimeSpan.FromMinutes(5)
+
+// Строгая валидация (рекомендуется)
+ClockSkew = TimeSpan.Zero
+```
+
+**Алгоритм проверки времени:**
+```csharp
+DateTime now = DateTime.UtcNow;
+DateTime effectiveNotBefore = token.ValidFrom.Subtract(ClockSkew);
+DateTime effectiveExpiration = token.ValidTo.Add(ClockSkew);
+
+if (now < effectiveNotBefore)
+    throw new SecurityTokenNotYetValidException();
+    
+if (now > effectiveExpiration)
+    throw new SecurityTokenExpiredException();
+```
+
+#### TokenReplayCache - Защита от Replay Атак
+
+**Интерфейс:** `ITokenReplayCache`
+
+**Реализация с Redis:**
+```csharp
+public class RedisTokenReplayCache : ITokenReplayCache
+{
+    private readonly IDistributedCache _cache;
+    
+    public async Task<bool> TryAddAsync(string securityToken, DateTime expiresOn)
+    {
+        // Хешируем токен для экономии памяти
+        var hash = ComputeSha256(securityToken);
+        var key = $"replay:{hash}";
+        
+        // Проверяем использование
+        var exists = await _cache.GetAsync(key);
+        if (exists != null)
+            return false; // Replay attack detected!
+        
+        // Сохраняем до истечения
+        await _cache.SetAsync(key, new byte[] { 1 }, 
+            new DistributedCacheEntryOptions
+            {
+                AbsoluteExpiration = expiresOn
+            });
+        
+        return true;
+    }
+}
+```
+
+### 1.3. Ключи и Алгоритмы Подписи
+
+#### HS256 vs RS256 vs ES256
+
+| Характеристика | HS256 | RS256 | ES256 |
+|----------------|-------|-------|-------|
+| **Тип** | Симметричный | Асимметричный | Асимметричный |
+| **Алгоритм** | HMAC-SHA256 | RSA-SHA256 | ECDSA-SHA256 |
+| **Ключ** | 256 бит secret | 2048+ бит RSA | 256 бит ECC |
+| **Подпись (ops/s)** | ~500k | ~2k | ~10k |
+| **Верификация (ops/s)** | ~500k | ~50k | ~5k |
+| **Размер подписи** | 256 бит | 2048 бит | 512 бит |
+| **Безопасность** | 256-bit | ~112-bit | ~128-bit |
+| **Когда использовать** | Внутренние API | OAuth, микросервисы | IoT, мобильные |
+
+**HS256 - Пример:**
+```csharp
+var key = new SymmetricSecurityKey(
+    Encoding.UTF8.GetBytes("my-secret-key-must-be-at-least-32-chars-long!"));
+    
+var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+```
+
+**RS256 - Пример:**
+```csharp
+var rsa = RSA.Create(2048);
+var key = new RsaSecurityKey(rsa);
+var credentials = new SigningCredentials(key, SecurityAlgorithms.RsaSha256);
+```
+
+**ES256 - Пример:**
+```csharp
+var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+var key = new ECDsaSecurityKey(ecdsa);
+var credentials = new SigningCredentials(key, SecurityAlgorithms.EcdsaSha256);
+```
+
+---
+
+## 2. ASP.NET CORE IDENTITY
+
+### 2.1. UserManager<TUser>
+
+**Namespace:** `Microsoft.AspNetCore.Identity`
+
+#### CreateAsync(TUser user, string password)
+
+**Внутренний процесс:**
+
+1. **Валидация паро ля:**
+   - Проверяет RequiredLength (по умолчанию 6)
+   - RequireDigit, RequireUppercase, RequireLowercase
+   - RequireNonAlphanumeric, RequiredUniqueChars
+   
+2. **Хеширование пароля:**
+   - Использует PBKDF2 с HMAC-SHA256
+   - 100,000 итераций (IdentityV3)
+   - 128-bit соль, 256-bit subkey
+   
+3. **Сохранение:**
+   - Вызывает Store.CreateAsync()
+   - Генерирует SecurityStamp (GUID)
+
+```csharp
+var result = await _userManager.CreateAsync(user, "Password123!");
+
+if (result.Succeeded)
+{
+    // Пользователь создан
+    var userId = user.Id;
+}
+else
+{
+    foreach (var error in result.Errors)
+    {
+        Console.WriteLine($"{error.Code}: {error.Description}");
+    }
+}
+```
+
+#### PasswordHasher<TUser>
+
+**Формат хеша (IdentityV3):**
+```
+Byte 0: 0x01 (версия)
+Bytes 1-4: PRF алгоритм (UInt32)
+Bytes 5-8: Количество итераций (UInt32)
+Bytes 9-12: Длина соли (UInt32)
+Bytes 13-28: Соль (16 байт)
+Bytes 29-60: Subkey (32 байта)
+```
+
+**Настройка:**
+```csharp
+services.Configure<PasswordHasherOptions>(options =>
+{
+    options.IterationCount = 150000; // Увеличиваем для большей безопасности
+});
+```
+
+### 2.2. SignInManager<TUser>
+
+#### CheckPasswordSignInAsync vs PasswordSignInAsync
+
+**CheckPasswordSignInAsync:**
+- Только проверка креденшелов
+- БЕЗ создания cookie
+- Возвращает SignInResult
+- Для REST API, JWT
+
+**PasswordSignInAsync:**
+- Проверка + создание cookie
+- Полный sign-in
+- Для MVC приложений
+
+```csharp
+// Для JWT (без cookie)
+var result = await _signInManager.CheckPasswordSignInAsync(
+    user, password, lockoutOnFailure: true);
+
+if (result.Succeeded)
+{
+    var token = GenerateJwtToken(user);
+    return Ok(new { Token = token });
+}
+
+// Для cookie auth
+await _signInManager.PasswordSignInAsync(
+    email, password, isPersistent: true, lockoutOnFailure: true);
+```
+
+### 2.3. IdentityOptions - ВСЕ настройки
+
+```csharp
+services.Configure<IdentityOptions>(options =>
+{
+    // Password
+    options.Password.RequiredLength = 12;
+    options.Password.RequireDigit = true;
+    options.Password.RequireUppercase = true;
+    options.Password.RequireLowercase = true;
+    options.Password.RequireNonAlphanumeric = true;
+    options.Password.RequiredUniqueChars = 4;
+    
+    // Lockout
+    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+    options.Lockout.MaxFailedAccessAttempts = 5;
+    options.Lockout.AllowedForNewUsers = true;
+    
+    // User
+    options.User.RequireUniqueEmail = true;
+    options.User.AllowedUserNameCharacters = 
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._@+";
+    
+    // SignIn
+    options.SignIn.RequireConfirmedEmail = true;
+    options.SignIn.RequireConfirmedPhoneNumber = false;
+    
+    // ClaimsIdentity
+    options.ClaimsIdentity.UserIdClaimType = ClaimTypes.NameIdentifier;
+    options.ClaimsIdentity.UserNameClaimType = ClaimTypes.Name;
+    options.ClaimsIdentity.RoleClaimType = ClaimTypes.Role;
+});
+```
+
+### 2.4. IdentityDbContext - Структура БД
+
+**Таблицы:**
+
+1. **AspNetUsers** - Пользователи
+   - Id, UserName, NormalizedUserName (индекс)
+   - Email, NormalizedEmail (индекс), EmailConfirmed
+   - PasswordHash, SecurityStamp, ConcurrencyStamp
+   - LockoutEnd, LockoutEnabled, AccessFailedCount
+
+2. **AspNetRoles** - Роли
+   - Id, Name, NormalizedName (уникальный индекс)
+
+3. **AspNetUserRoles** - Many-to-many
+   - UserId (FK), RoleId (FK)
+   - Composite PK: (UserId, RoleId)
+
+4. **AspNetUserClaims** - Claims пользователей
+   - Id, UserId (FK), ClaimType, ClaimValue
+
+5. **AspNetRoleClaims** - Claims ролей
+   - Id, RoleId (FK), ClaimType, ClaimValue
+
+6. **AspNetUserLogins** - External logins
+   - LoginProvider, ProviderKey (composite PK)
+   - UserId (FK), ProviderDisplayName
+
+7. **AspNetUserTokens** - Refresh tokens, 2FA keys
+   - UserId, LoginProvider, Name (composite PK)
+   - Value
+
+---
+
+## 3. AUTHENTICATION HANDLERS
+
+### 3.1. AuthenticationHandler<TOptions>
+
+**Lifecycle методов:**
+
+```csharp
+public abstract class CustomAuthHandler : AuthenticationHandler<CustomAuthOptions>
+{
+    // 1. Инициализация
+    protected override Task InitializeAsync(
+        AuthenticationScheme scheme,
+        HttpContext context)
+    {
+        // Вызывается один раз при первом использовании
+        return base.InitializeAsync(scheme, context);
+    }
+    
+    // 2. Аутентификация (ГЛАВНЫЙ метод)
+    protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
+    {
+        // Извлечь токен/cookie/etc
+        var token = Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        
+        if (string.IsNullOrEmpty(token))
+            return AuthenticateResult.NoResult();
+        
+        try
+        {
+            // Валидировать токен
+            var claims = ValidateToken(token);
+            var identity = new ClaimsIdentity(claims, Scheme.Name);
+            var principal = new ClaimsPrincipal(identity);
+            var ticket = new AuthenticationTicket(principal, Scheme.Name);
+            
+            return AuthenticateResult.Success(ticket);
+        }
+        catch (Exception ex)
+        {
+            return AuthenticateResult.Fail(ex.Message);
+        }
+    }
+    
+    // 3. Challenge (401 Unauthorized)
+    protected override Task HandleChallengeAsync(AuthenticationProperties properties)
+    {
+        // Вызывается, когда пользователь не аутентифицирован
+        Response.StatusCode = 401;
+        Response.Headers["WWW-Authenticate"] = $"Bearer realm=\"{Options.Realm}\"";
+        return Task.CompletedTask;
+    }
+    
+    // 4. Forbidden (403 Forbidden)
+    protected override Task HandleForbiddenAsync(AuthenticationProperties properties)
+    {
+        // Вызывается, когда пользователь аутентифицирован, но не авторизован
+        Response.StatusCode = 403;
+        return Task.CompletedTask;
+    }
+}
+```
+
+**Свойства:**
+- `Request` (HttpRequest) - текущий запрос
+- `Response` (HttpResponse) - текущий ответ
+- `Context` (HttpContext) - полный контекст
+- `Scheme` (AuthenticationScheme) - схема аутентификации
+- `Options` (TOptions) - настройки handler'а
+- `Clock` (ISystemClock) - для работы со временем
+- `Logger` (ILogger) - для логирования
+
+### 3.2. AuthenticationScheme
+
+```csharp
+services.AddAuthentication(options =>
+{
+    // Схема по умолчанию для аутентификации
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    
+    // Схема для Challenge (401)
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    
+    // Схема для Forbid (403)
+    options.DefaultForbidScheme = JwtBearerDefaults.AuthenticationScheme;
+    
+    // Схема для SignIn (создание cookie/токена)
+    options.DefaultSignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options => { })
+.AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options => { });
+```
+
+### 3.3. AuthenticateResult
+
+```csharp
+// Успех
+var ticket = new AuthenticationTicket(principal, Scheme.Name);
+return AuthenticateResult.Success(ticket);
+
+// Ошибка
+return AuthenticateResult.Fail("Invalid token");
+return AuthenticateResult.Fail(new SecurityTokenException("Token expired"));
+
+// Нет результата (другой handler попробует)
+return AuthenticateResult.NoResult();
+```
+
+**Свойства:**
+- `Succeeded` (bool)
+- `Failure` (Exception)
+- `Ticket` (AuthenticationTicket)
+- `Principal` (ClaimsPrincipal) - shortcut к Ticket.Principal
+- `None` (bool) - true если NoResult
+
+---
+
+## 4. AUTHORIZATION
+
+### 4.1. AuthorizationHandler<TRequirement>
+
+**Базовая реализация:**
+
+```csharp
+public class MinimumAgeRequirement : IAuthorizationRequirement
+{
+    public int MinimumAge { get; }
+    
+    public MinimumAgeRequirement(int minimumAge)
+    {
+        MinimumAge = minimumAge;
+    }
+}
+
+public class MinimumAgeHandler : AuthorizationHandler<MinimumAgeRequirement>
+{
+    protected override Task HandleRequirementAsync(
+        AuthorizationHandlerContext context,
+        MinimumAgeRequirement requirement)
+    {
+        // Получаем claim с датой рождения
+        var dateOfBirthClaim = context.User.FindFirst(
+            c => c.Type == ClaimTypes.DateOfBirth);
+        
+        if (dateOfBirthClaim == null)
+            return Task.CompletedTask; // Не удовлетворяет
+        
+        var dateOfBirth = DateTime.Parse(dateOfBirthClaim.Value);
+        var age = DateTime.Today.Year - dateOfBirth.Year;
+        
+        if (age >= requirement.MinimumAge)
+        {
+            context.Succeed(requirement); // Удовлетворяет!
+        }
+        
+        return Task.CompletedTask;
+    }
+}
+```
+
+**Регистрация:**
+```csharp
+services.AddAuthorization(options =>
+{
+    options.AddPolicy("AtLeast18", policy =>
+        policy.Requirements.Add(new MinimumAgeRequirement(18)));
+});
+
+services.AddSingleton<IAuthorizationHandler, MinimumAgeHandler>();
+```
+
+**Использование:**
+```csharp
+[Authorize(Policy = "AtLeast18")]
+public IActionResult AdultContent()
+{
+    return View();
+}
+```
+
+### 4.2. Resource-Based Authorization
+
+```csharp
+public class DocumentAuthorizationHandler : 
+    AuthorizationHandler<OperationAuthorizationRequirement, Document>
+{
+    protected override Task HandleRequirementAsync(
+        AuthorizationHandlerContext context,
+        OperationAuthorizationRequirement requirement,
+        Document resource)
+    {
+        if (requirement.Name == "Edit")
+        {
+            // Проверяем, является ли пользователь автором
+            if (resource.AuthorId == context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value)
+            {
+                context.Succeed(requirement);
+            }
+        }
+        
+        return Task.CompletedTask;
+    }
+}
+
+// Использование в контроллере
+public async Task<IActionResult> Edit(int documentId)
+{
+    var document = await _db.Documents.FindAsync(documentId);
+    
+    var authResult = await _authorizationService.AuthorizeAsync(
+        User, 
+        document, 
+        "Edit");
+    
+    if (!authResult.Succeeded)
+        return Forbid();
+    
+    return View(document);
+}
+```
+
+### 4.3. PolicyBuilder - Все методы
+
+```csharp
+services.AddAuthorization(options =>
+{
+    options.AddPolicy("ComprehensivePolicy", policy =>
+    {
+        // Требовать аутентификации
+        policy.RequireAuthenticatedUser();
+        
+        // Требовать роль
+        policy.RequireRole("Admin", "Manager");
+        
+        // Требовать claim
+        policy.RequireClaim("Department", "IT", "HR");
+        
+        // Требовать username
+        policy.RequireUserName("admin@example.com");
+        
+        // Кастомное условие
+        policy.RequireAssertion(context =>
+            context.User.HasClaim(c => c.Type == "EmployeeNumber" && 
+                                       int.Parse(c.Value) < 1000));
+        
+        // Кастомное requirement
+        policy.Requirements.Add(new MinimumAgeRequirement(18));
+        
+        // Требовать определённую схему аутентификации
+        policy.AuthenticationSchemes.Add(JwtBearerDefaults.AuthenticationScheme);
+    });
+});
+```
+
+---
+
+## 5. MIDDLEWARE И HTTP CONTEXT
+
+### 5.1. Порядок Middleware (КРИТИЧНО!)
+
+```csharp
+var app = builder.Build();
+
+app.UseRouting();           // 1. Определяет endpoint
+app.UseAuthentication();    // 2. Заполняет HttpContext.User
+app.UseAuthorization();     // 3. Проверяет права доступа
+app.MapControllers();       // 4. Маршрутизация к endpoints
+```
+
+**Почему порядок важен:**
+- `UseRouting()` должен быть первым, чтобы `UseAuthentication()` знал, к какому endpoint идёт запрос
+- `UseAuthentication()` должен быть перед `UseAuthorization()`, чтобы User был заполнен
+- Неправильный порядок = 401 ошибки с валидными токенами
+
+### 5.2. AuthenticationHttpContextExtensions
+
+```csharp
+// Sign In (создать cookie/session)
+await HttpContext.SignInAsync(
+    CookieAuthenticationDefaults.AuthenticationScheme,
+    principal,
+    new AuthenticationProperties
+    {
+        IsPersistent = true,
+        ExpiresUtc = DateTimeOffset.UtcNow.AddDays(7)
+    });
+
+// Sign Out
+await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+// Challenge (redirect to login)
+await HttpContext.ChallengeAsync(
+    OpenIdConnectDefaults.AuthenticationScheme,
+    new AuthenticationProperties { RedirectUri = "/dashboard" });
+
+// Forbid (403)
+await HttpContext.ForbidAsync();
+
+// Получить сохранённые токены
+var accessToken = await HttpContext.GetTokenAsync("access_token");
+var refreshToken = await HttpContext.GetTokenAsync("refresh_token");
+```
+
+---
+
+## 6. REFRESH TOKENS
+
+### 6.1. Token Rotation Pattern
+
+```csharp
+public class RefreshTokenService
+{
+    public async Task<TokenResponse> RefreshTokenAsync(string refreshToken)
+    {
+        // 1. Найти токен в БД
+        var storedToken = await _db.RefreshTokens
+            .FirstOrDefaultAsync(t => t.Token == HashToken(refreshToken));
+        
+        if (storedToken == null || storedToken.IsRevoked || storedToken.IsUsed)
+        {
+            // REPLAY ATTACK DETECTED!
+            await RevokeTokenFamily(storedToken.UserId, storedToken.FamilyId);
+            throw new SecurityException("Invalid refresh token");
+        }
+        
+        // 2. Проверить срок действия
+        if (storedToken.ExpiresAt < DateTime.UtcNow)
+            throw new SecurityException("Refresh token expired");
+        
+        // 3. Пометить как использованный
+        storedToken.IsUsed = true;
+        storedToken.UsedAt = DateTime.UtcNow;
+        
+        // 4. Генерировать новые токены
+        var newAccessToken = GenerateAccessToken(storedToken.UserId);
+        var newRefreshToken = GenerateRefreshToken();
+        
+        // 5. Сохранить новый refresh token
+        await _db.RefreshTokens.AddAsync(new RefreshToken
+        {
+            Token = HashToken(newRefreshToken),
+            UserId = storedToken.UserId,
+            FamilyId = storedToken.FamilyId, // Та же семья!
+            ExpiresAt = DateTime.UtcNow.AddDays(30),
+            CreatedAt = DateTime.UtcNow,
+            CreatedByIp = GetClientIp()
+        });
+        
+        await _db.SaveChangesAsync();
+        
+        return new TokenResponse
+        {
+            AccessToken = newAccessToken,
+            RefreshToken = newRefreshToken
+        };
+    }
+    
+    private async Task RevokeTokenFamily(string userId, string familyId)
+    {
+        // Отозвать ВСЮ семью токенов
+        var tokens = await _db.RefreshTokens
+            .Where(t => t.UserId == userId && t.FamilyId == familyId)
+            .ToListAsync();
+        
+        foreach (var token in tokens)
+        {
+            token.IsRevoked = true;
+            token.RevokedAt = DateTime.UtcNow;
+        }
+        
+        await _db.SaveChangesAsync();
+        
+        // Уведомить пользователя о подозрительной активности
+        await _emailService.SendSecurityAlert(userId);
+    }
+}
+```
+
+---
+
+## 7. OAUTH 2.0 И OPENID CONNECT
+
+### 7.1. Authorization Code Flow с PKCE
+
+```csharp
+public class PkceHelper
+{
+    public static (string verifier, string challenge) GeneratePkce()
+    {
+        // Генерируем code_verifier (43-128 символов)
+        var verifierBytes = new byte[32];
+        using (var rng = RandomNumberGenerator.Create())
+        {
+            rng.GetBytes(verifierBytes);
+        }
+        var verifier = Base64UrlEncode(verifierBytes);
+        
+        // Создаём code_challenge = BASE64URL(SHA256(verifier))
+        using (var sha256 = SHA256.Create())
+        {
+            var challengeBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(verifier));
+            var challenge = Base64UrlEncode(challengeBytes);
+            return (verifier, challenge);
+        }
+    }
+}
+
+// Использование
+var (verifier, challenge) = PkceHelper.GeneratePkce();
+
+// 1. Redirect на authorization endpoint
+var authUrl = $"https://auth.example.com/authorize?" +
+    $"response_type=code&" +
+    $"client_id={clientId}&" +
+    $"redirect_uri={redirectUri}&" +
+    $"scope=openid profile email&" +
+    $"code_challenge={challenge}&" +
+    $"code_challenge_method=S256&" +
+    $"state={state}";
+
+// 2. После redirect back, обменять code на токены
+var tokenRequest = new HttpRequestMessage(HttpMethod.Post, "https://auth.example.com/token");
+tokenRequest.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+{
+    ["grant_type"] = "authorization_code",
+    ["code"] = authorizationCode,
+    ["redirect_uri"] = redirectUri,
+    ["client_id"] = clientId,
+    ["code_verifier"] = verifier // PKCE!
+});
+```
+
+### 7.2. ID Token vs Access Token
+
+| **ID Token** | **Access Token** |
+|--------------|------------------|
+| Для идентификации пользователя | Для доступа к API |
+| Всегда JWT | JWT или opaque |
+| Audience = Client ID | Audience = API |
+| Claims о пользователе (name, email) | Claims о разрешениях (scope) |
+| Срок: 5-60 минут | Срок: 5-60 минут |
+| НЕ отправляется в API | Отправляется в Authorization header |
+
+---
+
+## 8. БЕЗОПАСНОСТЬ - OWASP
+
+### 8.1. Защита от атак
+
+**Brute Force:**
+```csharp
+services.Configure<IdentityOptions>(options =>
+{
+    options.Lockout.MaxFailedAccessAttempts = 5;
+    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+});
+```
+
+**Token Replay:**
+```csharp
+services.AddSingleton<ITokenReplayCache, DistributedTokenReplayCache>();
+```
+
+**CSRF (для cookies):**
+```csharp
+services.ConfigureApplicationCookie(options =>
+{
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+});
+```
+
+**Rate Limiting (.NET 7+):**
+```csharp
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter("login", opt =>
+    {
+        opt.PermitLimit = 5;
+        opt.Window = TimeSpan.FromMinutes(15);
+    });
+});
+
+app.UseRateLimiter();
+
+[EnableRateLimiting("login")]
+[HttpPost("login")]
+public async Task<IActionResult> Login(LoginModel model) { }
+```
+
+### 8.2. Secure Token Storage
+
+| Storage | XSS Risk | CSRF Risk | Рекомендация |
+|---------|----------|-----------|--------------|
+| localStorage | ❌ Высокий | ✅ Защищён | ❌ Не рекомендуется |
+| HttpOnly Cookie | ✅ Защищён | ❌ Уязвим | ✅ Рекомендуется + SameSite |
+| Memory только | ⚠️ Средний | ✅ Защищён | ✅ Для SPA |
+
+---
+
+## ЗАКЛЮЧЕНИЕ
+
+Эта лекция охватила глубокие технические аспекты аутентификации и авторизации в ASP.NET Core:
+
+**Ключевые выводы:**
+1. JWT токены требуют тщательной настройки TokenValidationParameters, особенно ClockSkew
+2. Identity предоставляет мощную систему хеширования паролей (PBKDF2, 100k итераций)
+3. Authentication Handlers работают в чётком lifecycle: Initialize → Authenticate → Challenge/Forbid
+4. Authorization построена на Requirements и Handlers для гибкой проверки прав
+5. Refresh tokens требуют ротации и защиты от replay атак
+6. Безопасность - это layers: rate limiting + lockout + token replay cache + secure storage
+
+**Best Practices:**
+- ✅ Всегда используйте HTTPS в production
+- ✅ Устанавливайте ClockSkew = TimeSpan.Zero для строгой валидации
+- ✅ Используйте RS256/ES256 для распределённых систем
+- ✅ Реализуйте token rotation для refresh tokens
+- ✅ Храните токены в HttpOnly cookies с SameSite=Strict
+- ✅ Применяйте rate limiting на authentication endpoints
+- ✅ Логируйте все security events
+
+**Дополнительные ресурсы:**
+- Microsoft Learn: https://learn.microsoft.com/aspnet/core/security/
+- ASP.NET Core GitHub: https://github.com/dotnet/aspnetcore
+- Andrew Lock's Blog: https://andrewlock.net
+- OWASP: https://owasp.org/www-project-api-security/
+
+Эта лекция дала вам глубокое понимание внутреннего устройства системы безопасности ASP.NET Core. Используйте эти знания для построения безопасных и production-ready приложений!
