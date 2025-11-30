@@ -24,8 +24,23 @@
 - `IsEmailConfirmed` — bool
 - `IsActive` — bool
 - `IsDeleted` — bool (для soft delete)
-- `RefreshToken` — string (nullable)
-- `RefreshTokenExpiryTime` — DateTime (nullable)
+
+### Модель UserSession
+Для управления сессиями:
+- `Id` — Guid
+- `UserId` — Guid, FK к User  
+- `RefreshTokenHash` — string
+- `CreatedAt` — DateTime
+- `ExpiresAt` — DateTime
+- `DeviceInfo` — string
+- `IpAddress` — string
+- `IsRevoked` — bool
+
+**Преимущества подхода:**
+- Поддержка нескольких активных сессий (несколько устройств)
+- Безопасное хеширование refresh токенов
+- Улучшенный аудит и мониторинг сессий
+- Соответствие принципам нормализации БД
 
 ### Модель Role
 Создайте модель роли:
@@ -101,13 +116,30 @@
 - Matches regex (только буквы, цифры, подчёркивание)
 - Асинхронная проверка уникальности в БД
 
-**Password:**
-- NotEmpty
-- MinLength(8)
-- Должен содержать заглавную букву
-- Должен содержать строчную букву
-- Должен содержать цифру
-- Должен содержать специальный символ
+### Конфигурируемая политика паролей
+
+**Настройка в appsettings.json:**
+```json
+{
+  "PasswordPolicy": {
+    "MinLength": 8,
+    "RequireUppercase": true,
+    "RequireLowercase": true,
+    "RequireDigit": true,
+    "RequireSpecialCharacter": true,
+    "AllowedSpecialCharacters": "!@#$%^&*()_+-=[]{}|;:'\",.<>?/~",
+    "MaxPasswordAgeInDays": 90
+  }
+}
+Валидация должна использовать конфигурируемые правила:
+
+Password:
+
+NotEmpty
+Minimum length из конфигурации
+Проверка требований к символам на основе настроек
+Проверка допустимых специальных символов
+
 
 **ConfirmPassword:**
 - Equal(Password)
